@@ -1,0 +1,206 @@
+snowflake://AmbikaS:Snowflake#2025@ZBBAZCF-TR85829/raw/test?warehouse=COMPUTE_WH&role=ACCOUNTADMIN
+duckdb:///C:/Users/ambik/ambik_backup/preswald_new/my_dir/sample/mydata.duckdb
+postgresql://postgres:postgres@localhost:5432/postgres
+sqlite:///C:/Users/ambik/example.db
+
+SELECT * FROM customer d left join customer  e on d.C_CUSTOMER_SK = e.C_CUSTOMER_SK limit 100
+SELECT * FROM customer limit 100
+
+--
+select * from employee
+SELECT * FROM employee2 LIMIT 10
+
+
+-- data type (snowflake)
+SELECT 
+    TABLE_NAME,
+    COLUMN_NAME,
+    DATA_TYPE
+FROM 
+    INFORMATION_SCHEMA.COLUMNS
+WHERE 
+    TABLE_NAME IN ('EMPLOYEE', 'EMPLOYEE2')
+ORDER BY 
+    TABLE_NAME, ORDINAL_POSITION;
+
+-- postgres query
+SELECT 
+    table_name,
+    column_name,
+    data_type
+FROM 
+    information_schema.columns
+WHERE 
+    table_name = 'employee'  -- lowercase unless the table was created with quotes
+    AND table_schema = 'public'  -- adjust schema if needed
+ORDER BY 
+    table_name, ordinal_position;
+
+
+-- duckdb
+SELECT 
+    table_name,
+    column_name,
+    data_type
+FROM 
+    information_schema.columns
+WHERE 
+    table_name IN ('radar')
+ORDER BY 
+    table_name, ordinal_position;
+
+--using join (inforation_schema)
+--  snowflake and duckdb
+
+SELECT 
+    c.table_catalog     AS DATABASE_NAME,
+    c.table_schema      AS SCHEMA_NAME,
+    c.table_name        AS TABLE_NAME,
+    t.table_type        AS TABLE_TYPE,
+    c.column_name       AS COLUMN_NAME,
+    c.ordinal_position  AS COLUMN_POSITION,
+    c.data_type         AS DATA_TYPE,
+    c.is_nullable       AS IS_NULLABLE,
+    c.column_default    AS DEFAULT_VALUE
+FROM 
+    information_schema.columns c
+JOIN 
+    information_schema.tables t
+    ON c.table_catalog = t.table_catalog
+   AND c.table_schema = t.table_schema
+   AND c.table_name = t.table_name
+WHERE 
+    c.table_name IN ('employee', 'employee2')
+ORDER BY 
+    c.table_name, c.ordinal_position;
+
+
+-- join query (from duckdb table to csv and loaded into snowflake table)
+
+SELECT 
+    de.id,
+    de.name,
+    de.dept_id
+FROM 
+    duck_employee de
+JOIN 
+    employee t
+ON 
+    de.id = t.id
+WHERE 
+    de.name = t.name AND de.dept_id = t.dept_id;
+
+--
+Great job so far! If you've already:
+
+✅ Compared matching and non-matching rows via joins
+
+✅ Fetched and compared data types
+
+✅ Exported/imported CSVs and worked with Snowflake stages
+
+Here are additional results and insights you can generate using your DuckDB + Snowflake setup:
+
+--agregation
+SELECT 
+  MAX(ID) AS ID,
+  MAX(NAME) AS NAME,
+  DEPT_ID
+FROM 
+  employee
+GROUP BY 
+  DEPT_ID
+ORDER BY 
+  DEPT_ID
+LIMIT 10;
+
+
+-- id's in source and not in target
+SELECT id
+FROM employee
+WHERE id NOT IN (SELECT id FROM employee_copy);
+
+-- ids in target an dnot in sourceSELECT id
+FROM employee_copy
+WHERE id NOT IN (SELECT id FROM employee);
+
+--Find mismatched rows with same ID
+SELECT s.id, s.name AS source_name, t.name AS target_name, 
+       s.dept_id AS source_dept, t.dept_id AS target_dept
+FROM employee s
+JOIN employee_copy t ON s.id = t.id
+WHERE s.name != t.name OR s.dept_id != t.dept_id;
+
+
+--Find mismatched rows with same ID
+SELECT s.id, s.name AS source_name, t.name AS target_name, 
+       s.dept_id AS source_dept, t.dept_id AS target_dept
+FROM employee s
+JOIN employee_copy t ON s.id = t.id
+WHERE s.name != t.name OR s.dept_id != t.dept_id;
+
+
+--Validate Primary Key Uniqueness
+SELECT id, COUNT(*) 
+FROM employee
+GROUP BY id
+HAVING COUNT(*) > 1;
+
+SELECT id, COUNT(*) 
+FROM employee_copy
+GROUP BY id
+HAVING COUNT(*) > 1;
+
+
+--Aggregate Comparison (optional)
+Check aggregates like totals, max, min:
+SELECT
+  MAX(id) AS max_id,
+  MIN(id) AS min_id,
+  COUNT(DISTINCT dept_id) AS unique_departments
+FROM employee;
+
+SELECT
+  MAX(id) AS max_id,
+  MIN(id) AS min_id,
+  COUNT(DISTINCT dept_id) AS unique_departments
+FROM employee_copy;
+
+-- MINUS (Compare distinct values in a column)
+SELECT dept_id
+FROM employee
+MINUS
+SELECT dept_id
+FROM employee_copy;
+
+SELECT dept_id
+FROM employee_COPY
+MINUS
+SELECT dept_id
+FROM employee;
+
+-- Column-wise summary stats for numeric fields
+SELECT
+  COUNT(*) AS row_count,
+  COUNT(DISTINCT id) AS unique_ids,
+  SUM(id) AS id_sum,
+  AVG(id) AS id_avg
+FROM employee;
+
+SELECT
+  COUNT(*) AS row_count,
+  COUNT(DISTINCT id) AS unique_ids,
+  SUM(id) AS id_sum,
+  AVG(id) AS id_avg
+FROM employee_copy;
+
+-- duplicates
+SELECT id, name, dept_id, COUNT(*)
+FROM employee
+GROUP BY id, name, dept_id
+HAVING COUNT(*) > 1;
+
+SELECT id, name, dept_id, COUNT(*)
+FROM employee_copy
+GROUP BY id, name, dept_id
+HAVING COUNT(*) > 1;
