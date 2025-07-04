@@ -1,770 +1,1000 @@
-import os
-import shutil
-import tempfile
-from io import StringIO
 
-import example_duck
+# working code
 import streamlit as st
-from code_editor import code_editor
-
 from sqlalchemy import create_engine, text
-from snowflake.sqlalchemy import URL as SnowflakeURL
-from sqlalchemy.exc import SQLAlchemyError
+import polars as pl
+import duckdb
+import io
 
-# --- Streamlit config ---
-st.set_page_config(page_title="ducklit", page_icon=":duck:")
+# Setup
+st.set_page_config(page_title="Data Comparison Tool", layout="wide")
+st.title("🔍 Data Comparison Tool - File or DB vs DB")
 
-# --- DuckDB Connection ---
-def get_db_connection():
-    if "duck_conn" not in st.session_state:
-        st.session_state["duck_conn"] = example_duck.connect(":memory:")
-    return st.session_state["duck_conn"]
+# Connect to DuckDB in-memory
+duckdiffDB = duckdb.connect(database=":memory:")
 
-# --- Snowflake SQLAlchemy URL ---
-def get_snowflake_url():
-    return SnowflakeURL(
-        user="Ambika",
-        password="Snowflake#2025",
-        account="POEVRBR-DW28551",
-        warehouse="COMPUTE_WH",
-        database="RAW",
-        schema="TEST",
-        role="ACCOUNTADMIN"
-    )
+# Layout
+left_col, right_col = st.columns(2)
 
-# --- Main ---
-def main():
-    conn = get_db_connection()
-    create_side_bar(conn)
-    create_page(conn)
+# ---------- LEFT: Source Input (File + DB) ----------
+with left_col:
+    st.subheader("📂 Source Input")
 
-# --- Sidebar UI ---
-def create_side_bar(conn: example_duck.DuckDBPyConnection):
-    cur = conn.cursor()
+    source_input_type = st.radio("Source Type", ["CSV", "JSON", "Database"], horizontal=True)
 
-    with st.sidebar:
-        st.markdown("## 📁 Uploads")
-        st.button("📥 Load Sample Data", on_click=load_sample_data, args=[conn])
+    uploaded_file = st.file_uploader("Upload Source File (optional)", type=["csv", "json"])
+    source_db_url = st.text_input("Source DB URL", placeholder="e.g., sqlite:///source.db")
+    source_query = st.text_area("Source Query", "SELECT * FROM employee")
 
-        files = st.file_uploader("Upload CSV or JSON files", accept_multiple_files=True)
-        load_files(conn, files)
+# ---------- RIGHT: Target DB ----------
+with right_col:
+    st.subheader("🎯 Target Database")
+    target_db_url = st.text_input("Target DB URL", placeholder="e.g., sqlite:///target.db")
+    target_query = st.text_area("Target Query", "SELECT * FROM employee")
 
-        st.divider()
-        st.markdown("## ❄️ Snowflake")
-        if st.checkbox("Connect and load from Snowflake"):
-            table_name = st.text_input("Enter Snowflake Table Name")
-            if st.button("🚀 Load Table from Snowflake"):
-                load_from_snowflake(table_name, conn)
-
-        st.divider()
-        st.markdown("## 🦆 Import DuckDB Database")
-        db_file = st.file_uploader("Upload a .duckdb file", type=["duckdb"])
-        if db_file is not None:
-            import_duckdb_file(conn, db_file)
-
-        st.divider()
-        st.markdown("## 📊 Tables in DuckDB")
-        table_list = ""
-
-        try:
-            cur.execute("SHOW TABLES")
-            recs = cur.fetchall()
-            if len(recs) > 0:
-                for rec in recs:
-                    table_name = rec[0]
-                    table_list += f"- `{table_name}`\n"
-                    cur.execute(f"DESCRIBE {table_name}")
-                    for col in cur.fetchall():
-                        table_list += f"    - {col[0]} {col[1]}\n"
-            else:
-                table_list = "_No tables found in DuckDB_"
-        except Exception as e:
-            table_list = f"❌ Error: {e}"
-
-        st.markdown(table_list)
-
-# --- Load CSV / JSON into DuckDB ---
-def load_files(conn: example_duck.DuckDBPyConnection, files: list):
-    for file in files:
-        stringio = StringIO(file.getvalue().decode("utf-8"))
-
-        if file.name.endswith(".csv"):
-            conn.read_csv(stringio).create(file.name[:-4])
-        elif file.name.endswith(".json"):
-            with open(file.name, "w") as temp_file:
-                stringio.seek(0)
-                shutil.copyfileobj(stringio, temp_file)
-            conn.read_json(file.name).create(file.name[:-5])
-            os.remove(file.name)
-
-# --- Load Sample JSON ---
-def load_sample_data(conn: example_duck.DuckDBPyConnection):
-    conn.read_json("sample_data/posts.json").create("posts")
-
-# --- Load from Snowflake using SQLAlchemy ---
-def load_from_snowflake(table_name: str, duckdb_conn: example_duck.DuckDBPyConnection):
+# ---------- Show IDs in Target but Not in Source ----------
+def show_target_not_in_source():
+    st.subheader("🚫 IDs in Target but Not in Source")
     try:
-        sf_engine = create_engine(get_snowflake_url())
-        with sf_engine.connect() as sf_conn:
-            result = sf_conn.execute(text(f"SELECT * FROM {table_name}"))
-            rows = result.fetchall()
+        source_cols = duckdiffDB.execute("PRAGMA table_info(source_table)").fetchdf()
+        target_cols = duckdiffDB.execute("PRAGMA table_info(target_table)").fetchdf()
 
-            if not rows:
-                st.warning("Snowflake table is empty.")
+        source_col_names = set(col.strip().lower() for col in source_cols['name'])
+        target_col_names = set(col.strip().lower() for col in target_cols['name'])
+        common_cols = source_col_names.intersection(target_col_names)
+
+        if not common_cols:
+            st.warning("No common columns found.")
+            return
+
+        key_col = "id" if "id" in common_cols else list(common_cols)[0]
+        st.markdown(f"🔑 Comparing by `{key_col}`")
+
+        query = f"""
+            SELECT {key_col}
+            FROM target_table
+            WHERE {key_col} NOT IN (SELECT {key_col} FROM source_table)
+        """
+        not_in_df = duckdiffDB.execute(query).fetchdf()
+        if not not_in_df.empty:
+            st.dataframe(not_in_df, use_container_width=True)
+            st.success(f"Found {not_in_df.shape[0]} target IDs missing in source.")
+        else:
+            st.info("✅ All target IDs are present in source.")
+    except Exception as e:
+        st.warning(f"Error: {e}")
+
+# ---------- Show Record-Level Differences ----------
+def show_record_level_diff():
+    st.subheader("🔄 Non-Matching Records")
+    try:
+        target_not_in_source = duckdiffDB.execute("""
+            SELECT *, 'target' AS source
+            FROM target_table
+            EXCEPT
+            SELECT *, 'target'
+            FROM source_table
+        """).fetchdf()
+
+        source_not_in_target = duckdiffDB.execute("""
+            SELECT *, 'source' AS source
+            FROM source_table
+            EXCEPT
+            SELECT *, 'source'
+            FROM target_table
+        """).fetchdf()
+
+        full_diff_df = pl.concat([
+            pl.from_pandas(source_not_in_target),
+            pl.from_pandas(target_not_in_source)
+        ])
+
+        if not full_diff_df.is_empty():
+            st.dataframe(full_diff_df.to_pandas(), use_container_width=True)
+            st.success(f"✅ Found {full_diff_df.shape[0]} non-matching records.")
+        else:
+            st.info("✅ No differences found.")
+    except Exception as e:
+        st.warning(f"❌ Diff error: {e}")
+
+# ---------- Run Comparison ----------
+if st.button("Run Comparison"):
+    if (uploaded_file or (source_db_url.strip() and source_query.strip())) and \
+       target_db_url.strip() and target_query.strip():
+        try:
+            duckdiffDB.execute("DROP TABLE IF EXISTS source_table")
+            duckdiffDB.execute("DROP TABLE IF EXISTS target_table")
+
+            # Load Source
+            if uploaded_file:
+                if source_input_type == "CSV":
+                    source_df = pl.read_csv(uploaded_file)
+                elif source_input_type == "JSON":
+                    content = uploaded_file.read()
+                    source_df = pl.read_json(io.BytesIO(content))
+            elif source_db_url and source_query:
+                source_engine = create_engine(source_db_url)
+                with source_engine.connect() as conn:
+                    source_df = pl.read_database(query=text(source_query), connection=conn)
+            else:
+                st.error("⚠️ Provide either a file or DB URL + query for source.")
+                st.stop()
+
+            source_df = source_df.rename({col: col.strip().lower() for col in source_df.columns})
+            duckdiffDB.register("source_table", source_df)
+            st.subheader("📘 Source Table Preview")
+            st.dataframe(source_df.to_pandas())
+
+            # Load Target
+            target_engine = create_engine(target_db_url)
+            with target_engine.connect() as conn:
+                target_df = pl.read_database(query=text(target_query), connection=conn)
+            target_df = target_df.rename({col: col.strip().lower() for col in target_df.columns})
+            duckdiffDB.register("target_table", target_df)
+            st.subheader("📙 Target Table Preview")
+            st.dataframe(target_df.to_pandas())
+
+            # Show diffs
+            show_target_not_in_source()
+            show_record_level_diff()
+
+        except Exception as e:
+            st.error(f"❌ Comparison failed:\n{e}")
+    else:
+        st.error("⚠️ Please provide all required input.")
+
+
+# csv working 
+import streamlit as st
+from sqlalchemy import create_engine, text
+import polars as pl
+import duckdb
+import io
+
+# Setup
+st.set_page_config(page_title="Data Comparison Tool", layout="wide")
+st.title("🔍 Data Comparison Tool - File or DB vs DB")
+
+# DuckDB in-memory instance
+duckdiffDB = duckdb.connect(database=":memory:")
+
+# Layout
+left_col, right_col = st.columns(2)
+
+# ---------- LEFT: Source Input ----------
+with left_col:
+    st.subheader("📂 Source Input")
+    source_input_type = st.radio("Source Type", ["CSV", "JSON", "Database"], horizontal=True)
+    uploaded_file = st.file_uploader("Upload Source File (optional)", type=["csv", "json"])
+    source_db_url = st.text_input("Source DB URL", placeholder="e.g., sqlite:///source.db")
+    source_query = st.text_area("Source Query", "SELECT * FROM source_table")
+
+# ---------- RIGHT: Target DB ----------
+with right_col:
+    st.subheader("🎯 Target Database")
+    target_db_url = st.text_input("Target DB URL", placeholder="e.g., sqlite:///target.db")
+    target_query = st.text_area("Target Query", "SELECT * FROM target_table")
+
+# ---------- Show Target Not in Source ----------
+def show_target_not_in_source():
+    st.subheader("🚫 IDs in Target but Not in Source")
+    try:
+        source_cols = duckdiffDB.execute("PRAGMA table_info(source_table)").fetchdf()
+        target_cols = duckdiffDB.execute("PRAGMA table_info(target_table)").fetchdf()
+
+        source_col_names = set(col.strip().lower() for col in source_cols['name'])
+        target_col_names = set(col.strip().lower() for col in target_cols['name'])
+        common_cols = source_col_names.intersection(target_col_names)
+
+        if not common_cols:
+            st.warning("No common columns found.")
+            return
+
+        key_col = "id" if "id" in common_cols else list(common_cols)[0]
+        st.markdown(f"🔑 Comparing by `{key_col}`")
+
+        query = f"""
+            SELECT {key_col}
+            FROM target_table
+            WHERE {key_col} NOT IN (SELECT {key_col} FROM source_table)
+        """
+        not_in_df = duckdiffDB.execute(query).fetchdf()
+        if not not_in_df.empty:
+            st.dataframe(pl.from_pandas(not_in_df), use_container_width=True)
+            st.success(f"Found {not_in_df.shape[0]} target IDs missing in source.")
+        else:
+            st.info("✅ All target IDs are present in source.")
+    except Exception as e:
+        st.warning(f"Error: {e}")
+
+# ---------- Show Record-Level Differences ----------
+def show_record_level_diff():
+    st.subheader("🔄 Non-Matching Records")
+    try:
+        target_not_in_source = duckdiffDB.execute("""
+            SELECT *, 'target' AS origin
+            FROM target_table
+            EXCEPT
+            SELECT *, 'target'
+            FROM source_table
+        """).fetchdf()
+
+        source_not_in_target = duckdiffDB.execute("""
+            SELECT *, 'source' AS origin
+            FROM source_table
+            EXCEPT
+            SELECT *, 'source'
+            FROM target_table
+        """).fetchdf()
+
+        full_diff = pl.concat([
+            pl.from_pandas(source_not_in_target),
+            pl.from_pandas(target_not_in_source)
+        ])
+
+        if not full_diff.is_empty():
+            st.dataframe(full_diff, use_container_width=True)
+            st.success(f"✅ Found {full_diff.shape[0]} non-matching records.")
+        else:
+            st.info("✅ No differences found.")
+    except Exception as e:
+        st.warning(f"❌ Diff error: {e}")
+
+# ---------- Run Comparison ----------
+if st.button("Run Comparison"):
+    if (uploaded_file or (source_db_url.strip() and source_query.strip())) and \
+       target_db_url.strip() and target_query.strip():
+        try:
+            duckdiffDB.execute("DROP TABLE IF EXISTS source_table")
+            duckdiffDB.execute("DROP TABLE IF EXISTS target_table")
+
+            # Load Source
+            if uploaded_file:
+                if source_input_type == "CSV":
+                    source_df = pl.read_csv(uploaded_file)
+                elif source_input_type == "JSON":
+                    content = uploaded_file.read()
+                    source_df = pl.read_json(io.BytesIO(content))
+                source_df = source_df.rename({col: col.strip().lower() for col in source_df.columns})
+                duckdiffDB.register("source_table", source_df)
+            elif source_db_url and source_query:
+                source_engine = create_engine(source_db_url)
+                with source_engine.connect() as conn:
+                    source_df = pl.read_database(query=text(source_query), connection=conn)
+                source_df = source_df.rename({col: col.strip().lower() for col in source_df.columns})
+                duckdiffDB.register("source_table", source_df)
+            else:
+                st.error("⚠️ Provide either file or DB + query for source.")
+                st.stop()
+
+            # Preview or query result
+            result_df = duckdiffDB.execute(source_query).fetchdf()
+            st.subheader("📘 Source Table Preview")
+            st.dataframe(pl.from_pandas(result_df), use_container_width=True)
+
+            # Load Target
+            target_engine = create_engine(target_db_url)
+            with target_engine.connect() as conn:
+                target_df = pl.read_database(query=text(target_query), connection=conn)
+            target_df = target_df.rename({col: col.strip().lower() for col in target_df.columns})
+            duckdiffDB.register("target_table", target_df)
+            st.subheader("📙 Target Table Preview")
+            st.dataframe(target_df, use_container_width=True)
+
+            # Show diffs only if full table queries
+            if "select *" in source_query.lower() and "select *" in target_query.lower():
+                show_target_not_in_source()
+                show_record_level_diff()
+
+        except Exception as e:
+            st.error(f"❌ Comparison failed:\n{e}")
+    else:
+        st.error("⚠️ Please provide all required input.")
+
+
+# working good
+    import streamlit as st
+    from sqlalchemy import create_engine, text
+    import polars as pl
+    import duckdb
+    import io
+
+    # Setup
+    st.set_page_config(page_title="Data Comparison Tool", layout="wide")
+    st.title("🔍 Data Comparison Tool - File or DB vs DB")
+
+    # DuckDB in-memory instance
+    duckdiffDB = duckdb.connect(database=":memory:")
+
+    # Layout
+    left_col, right_col = st.columns(2)
+
+    # ---------- LEFT: Source Input ----------
+    with left_col:
+        st.subheader("📂 Source Input")
+        source_input_type = st.radio("Source Type", ["CSV", "JSON", "Database"], horizontal=True)
+        uploaded_file = st.file_uploader("Upload Source File (optional)", type=["csv", "json"])
+        source_db_url = st.text_input("Source DB URL", placeholder="e.g., sqlite:///source.db")
+        source_query = st.text_area("Source Query", "SELECT * FROM source_table")
+
+    # ---------- RIGHT: Target DB ----------
+    with right_col:
+        st.subheader("🎯 Target Database")
+        target_db_url = st.text_input("Target DB URL", placeholder="e.g., sqlite:///target.db")
+        target_query = st.text_area("Target Query", "SELECT * FROM target_table")
+
+    # ---------- Show Target Not in Source ----------
+    def show_target_not_in_source():
+        st.subheader("🚫 IDs in Target but Not in Source")
+        try:
+            source_cols = duckdiffDB.execute("PRAGMA table_info(source_table)").fetchdf()
+            target_cols = duckdiffDB.execute("PRAGMA table_info(target_table)").fetchdf()
+
+            source_col_names = set(col.strip().lower() for col in source_cols['name'])
+            target_col_names = set(col.strip().lower() for col in target_cols['name'])
+            common_cols = source_col_names.intersection(target_col_names)
+
+            if not common_cols:
+                st.warning("No common columns found.")
                 return
 
-            columns = result.keys()
-            col_defs = ", ".join([f"{col} TEXT" for col in columns])
-            duckdb_conn.execute(f"CREATE OR REPLACE TABLE {table_name} ({col_defs})")
+            key_col = "id" if "id" in common_cols else list(common_cols)[0]
+            st.markdown(f"🔑 Comparing by `{key_col}`")
 
-            values = [tuple(str(val) if val is not None else "" for val in row) for row in rows]
-            placeholders = ", ".join(["?"] * len(columns))
+            query = f"""
+                SELECT {key_col}
+                FROM target_table
+                WHERE {key_col} NOT IN (SELECT {key_col} FROM source_table)
+            """
+            not_in_df = duckdiffDB.execute(query).fetchdf()
+            if not not_in_df.empty:
+                st.dataframe(pl.from_pandas(not_in_df), use_container_width=True)
+                st.success(f"Found {not_in_df.shape[0]} target IDs missing in source.")
+            else:
+                st.info("✅ All target IDs are present in source.")
+        except Exception as e:
+            st.warning(f"Error: {e}")
 
-            duckdb_conn.executemany(
-                f"INSERT INTO {table_name} VALUES ({placeholders})", values
-            )
+    # ---------- Show Record-Level Differences ----------
+    def show_record_level_diff():
+        st.subheader("🔄 Non-Matching Records")
+        try:
+            target_not_in_source = duckdiffDB.execute("""
+                SELECT *, 'target' AS origin
+                FROM target_table
+                EXCEPT
+                SELECT *, 'target'
+                FROM source_table
+            """).fetchdf()
 
-            st.success(f"✅ Loaded {len(values)} rows from Snowflake into DuckDB")
+            source_not_in_target = duckdiffDB.execute("""
+                SELECT *, 'source' AS origin
+                FROM source_table
+                EXCEPT
+                SELECT *, 'source'
+                FROM target_table
+            """).fetchdf()
 
-    except SQLAlchemyError as e:
-        st.error(f"❌ Snowflake error: {e}")
-    except Exception as e:
-        st.error(f"⚠️ DuckDB insert error: {e}")
+            full_diff = pl.concat([
+                pl.from_pandas(source_not_in_target),
+                pl.from_pandas(target_not_in_source)
+            ])
 
-# --- Import DuckDB File ---
-def import_duckdb_file(conn: example_duck.DuckDBPyConnection, db_file):
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".duckdb") as tmp_file:
-            tmp_file.write(db_file.getbuffer())
-            db_path = tmp_file.name
+            if not full_diff.is_empty():
+                st.dataframe(full_diff, use_container_width=True)
+                st.success(f"✅ Found {full_diff.shape[0]} non-matching records.")
+            else:
+                st.info("✅ No differences found.")
+        except Exception as e:
+            st.warning(f"❌ Diff error: {e}")
 
-        conn.execute(f"ATTACH DATABASE '{db_path}' AS extdb")
-
-        schemas = conn.execute("SELECT schema_name FROM extdb.information_schema.schemata").fetchall()
-        table_count = 0
-        for (schema,) in schemas:
-            tables = conn.execute(
-                f"""
-                SELECT table_name 
-                FROM extdb.information_schema.tables 
-                WHERE table_schema = '{schema}'
-                """
-            ).fetchall()
-            for (table,) in tables:
-                conn.execute(f"CREATE OR REPLACE TABLE {table} AS SELECT * FROM extdb.\"{schema}\".\"{table}\"")
-                table_count += 1
-
-        st.success(f"✅ Loaded {table_count} table(s) from {db_file.name}")
-    except Exception as e:
-        st.error(f"❌ Failed to load DuckDB file: {e}")
-
-# --- Main Query Page ---
-def create_page(conn: example_duck.DuckDBPyConnection):
-    st.title("ducklit :duck:")
-    st.write("Query your files or Snowflake data using DuckDB SQL")
-    st.divider()
-
-    cur = conn.cursor()
-    st.write("💡 Hint: End each SQL statement with a semicolon (;)")
-    st.write("⌨️ Press Ctrl+Enter to execute")
-
-    res = code_editor(code="", lang="sql", key="editor")
-
-    for query in res["text"].split(";"):
-        query = query.strip()
-        if query:
+    # ---------- Run Comparison ----------
+    if st.button("Run Comparison"):
+        if (uploaded_file or (source_db_url.strip() and source_query.strip())) and \
+        target_db_url.strip() and target_query.strip():
             try:
-                cur.execute(query)
-                df = cur.fetch_df()
-                if not df.empty:
-                    st.dataframe(df, use_container_width=True)
+                duckdiffDB.execute("DROP TABLE IF EXISTS source_table")
+                duckdiffDB.execute("DROP TABLE IF EXISTS target_table")
+
+                # Load Source
+                if uploaded_file:
+                    if source_input_type == "CSV":
+                        source_df = pl.read_csv(uploaded_file)
+                    elif source_input_type == "JSON":
+                        content = uploaded_file.read()
+                        source_df = pl.read_json(io.BytesIO(content))
+                    source_df = source_df.rename({col: col.strip().lower() for col in source_df.columns})
+                    duckdiffDB.register("source_table", source_df)
+                elif source_db_url and source_query:
+                    source_engine = create_engine(source_db_url)
+                    with source_engine.connect() as conn:
+                        source_df = pl.read_database(query=text(source_query), connection=conn)
+                    source_df = source_df.rename({col: col.strip().lower() for col in source_df.columns})
+                    duckdiffDB.register("source_table", source_df)
                 else:
-                    st.info("✅ Query successful. No rows returned.")
-            except Exception as e:
-                st.error(f"⚠️ {e}")
-
-    if st.button("🔄 Reset Database"):
-        st.cache_resource.clear()
-        st.session_state["editor"]["text"] = ""
-        st.session_state.pop("duck_conn", None)
-        st.rerun()
-
-if __name__ == "__main__":
-    main()
-
-
-# showing diff
-
-import streamlit as st
-from sqlalchemy import create_engine, text
-import example_duck
-import polars as pl
-import pandas as pd
-
-st.set_page_config(page_title="Data Comparison Tool - Row Differences Only", layout="wide")
-st.title("🔍 Data Comparison Tool - Row-by-Row Differences")
-
-source, target = st.columns(2)
-
-duckdiffDB = example_duck.connect(database=":memory:")
-
-with source:
-    source_db_url = st.text_input("Source DB URL", placeholder="e.g., sqlite:///mydb.sqlite")
-    source_query = st.text_area("Source Query", "SELECT * FROM my_table LIMIT 10")
-
-with target:
-    target_db_url = st.text_input("Target DB URL", placeholder="e.g., sqlite:///mydb.sqlite")
-    target_query = st.text_area("Target Query", "SELECT * FROM my_table LIMIT 10")
-
-if st.button("Run SQL"):
-    if not source_db_url or not target_db_url or not source_query.strip() or not target_query.strip():
-        st.error("Please enter both DB URLs and SQL queries.")
-    else:
-        log = st.empty()
-        try:
-            duckdiffDB.execute("DROP TABLE IF EXISTS source_table")
-            duckdiffDB.execute("DROP TABLE IF EXISTS target_table")
-
-            source_engine = create_engine(source_db_url)
-            target_engine = create_engine(target_db_url)
-
-            with source_engine.connect() as conn:
-                df_source = pl.read_database(text(source_query), connection=conn)
-            with target_engine.connect() as conn:
-                df_target = pl.read_database(text(target_query), connection=conn)
-
-            # Convert to pandas for comparison
-            pdf_source = df_source.to_pandas()
-            pdf_target = df_target.to_pandas()
-
-            # Truncate to the minimum row count
-            min_len = min(len(pdf_source), len(pdf_target))
-            pdf_source = pdf_source.head(min_len)
-            pdf_target = pdf_target.head(min_len)
-
-            # Pad shorter column lists if number of columns mismatch
-            max_cols = max(pdf_source.shape[1], pdf_target.shape[1])
-
-            mismatches = []
-            for i in range(min_len):
-                row_src = pdf_source.iloc[i].tolist()
-                row_tgt = pdf_target.iloc[i].tolist()
-
-                # Pad shorter rows to align comparison
-                while len(row_src) < max_cols:
-                    row_src.append(None)
-                while len(row_tgt) < max_cols:
-                    row_tgt.append(None)
-
-                if row_src != row_tgt:
-                    mismatch = {"Row #": i + 1}
-                    for j in range(max_cols):
-                        mismatch[f"SRC_col{j+1}"] = str(row_src[j])
-                        mismatch[f"TGT_col{j+1}"] = str(row_tgt[j])
-                    mismatches.append(mismatch)
-
-            if mismatches:
-                st.warning(f"⚠️ {len(mismatches)} row(s) differ.")
-                st.dataframe(pd.DataFrame(mismatches))
-            else:
-                st.success("✅ All rows match.")
-
-        except Exception as e:
-            st.error(f"An error occurred:\n{e}")
-
-
-# set 3 ( to show only non matchig rows)
-import streamlit as st
-from sqlalchemy import create_engine, text
-import example_duck
-import polars as pl
-
-# ---------- UI ----------
-st.set_page_config(page_title="Data Comparison Tool - Differences Only", layout="wide")
-st.title("🔍 Data Comparison Tool - Row-based Differences")
-
-source, target = st.columns(2)
-duckdiffDB = example_duck.connect(database=":memory:")
-
-with source:
-    source_db_url = st.text_input("Enter SQLAlchemy Source Database URL", placeholder="e.g., sqlite:///mydb.sqlite")
-    st.subheader("Source Query")
-    source_query = st.text_area("Enter SQL query for Source", "SELECT * FROM my_table LIMIT 10")
-
-with target:
-    target_db_url = st.text_input("Enter SQLAlchemy Target Database URL", placeholder="e.g., sqlite:///mydb.sqlite")
-    st.subheader("Target Query")
-    target_query = st.text_area("Enter SQL query for Target", "SELECT * FROM my_table LIMIT 10")
-
-if st.button("Run SQL"):
-    if not source_db_url or not target_db_url or not source_query.strip() or not target_query.strip():
-        st.error("Please provide both database URLs and SQL queries.")
-    else:
-        log = st.empty()
-        try:
-            log.text("Starting comparison...")
-            duckdiffDB.execute("DROP TABLE IF EXISTS source_table")
-            duckdiffDB.execute("DROP TABLE IF EXISTS target_table")
-
-            source_engine = create_engine(source_db_url)
-            target_engine = create_engine(target_db_url)
-
-            # Read source
-            with source_engine.connect() as conn:
-                df_source = pl.read_database(query=text(source_query), connection=conn)
-                duckdiffDB.register("source_table", df_source)
-
-            # Read target
-            with target_engine.connect() as conn:
-                df_target = pl.read_database(query=text(target_query), connection=conn)
-                duckdiffDB.register("target_table", df_target)
-
-            # Combine and find rows not in both
-            query = """
-            SELECT 'source' as __origin__, * FROM source_table
-            EXCEPT
-            SELECT 'source' as __origin__, * FROM target_table
-            UNION ALL
-            SELECT 'target' as __origin__, * FROM target_table
-            EXCEPT
-            SELECT 'target' as __origin__, * FROM source_table
-            """
-
-            result = duckdiffDB.execute(query).fetchdf()
-            st.success("Comparison complete. Showing non-matching rows:")
-            st.dataframe(result, use_container_width=True)
-
-        except Exception as e:
-            st.error(f"An error occurred: {e}")
-
-# bala's code
-
-import streamlit as st
-from sqlalchemy import create_engine, text
-import duckdb
-import polars as pl
-
-# ---------- UI ----------
-st.set_page_config(page_title="Data Comparison Tool - Differences Only", layout="wide")
-st.title("🔍 Data Comparison Tool - Query-based Differences")
-
-source, target = st.columns(2)
-
-# Create DuckDB in-memory instance
-duckdiffDB = duckdb.connect(database=":memory:")
-
-with source:
-    source_db_url = st.text_input("Enter SQLAlchemy Source Database URL",
-                                   placeholder="e.g., sqlite:///mydb.sqlite or snowflake://user:pass@account/db/schema")
-    st.subheader("Source Query")
-    source_query = st.text_area("Enter SQL query for Source", "SELECT * FROM my_table LIMIT 10")
-
-with target:
-    target_db_url = st.text_input("Enter SQLAlchemy Target Database URL",
-                                   placeholder="e.g., sqlite:///mydb.sqlite or snowflake://user:pass@account/db/schema")
-    st.subheader("Target Query")
-    target_query = st.text_area("Enter SQL query for Target", "SELECT * FROM my_table LIMIT 10")
-
-# Run button
-if st.button("Run SQL"):
-    if not source_db_url or not source_query.strip() or not target_db_url or not target_query.strip():
-        st.error("Please provide both a database URL and a SQL query.")
-    else:
-        log = st.empty()
-        try:
-            log.text("🟡 Starting the DuckDiff process...")
-            duckdiffDB.execute("DROP TABLE IF EXISTS source_table")
-            duckdiffDB.execute("DROP TABLE IF EXISTS target_table")
-
-            # Connect to databases
-            source_engine = create_engine(source_db_url)
-            target_engine = create_engine(target_db_url)
-            sourceHasResults = targetHasResults = False
-            source_columns = target_columns = []
-
-            # Source
-            log.text("🔗 Connecting to source database...")
-            with source_engine.connect() as connection:
-                df = pl.read_database(query=text(source_query), connection=connection)
-                if not df.is_empty():
-                    sourceHasResults = True
-                    duckdiffDB.register("source_table", df)
-                    source_columns = df.columns
-                    df.clear()
-                    log.text("✅ Source results loaded into DuckDB.")
-                else:
-                    log.text("⚠️ Source returned no data.")
-
-            # Target
-            log.text("🔗 Connecting to target database...")
-            with target_engine.connect() as connection:
-                df = pl.read_database(query=text(target_query), connection=connection)
-                if not df.is_empty():
-                    targetHasResults = True
-                    duckdiffDB.register("target_table", df)
-                    target_columns = df.columns
-                    df.clear()
-                    log.text("✅ Target results loaded into DuckDB.")
-                else:
-                    log.text("⚠️ Target returned no data.")
-
-            # Proceed if both have data
-            if sourceHasResults and targetHasResults:
-                # Show registered tables
-                log.text("📋 Listing tables in DuckDB...")
-                tables_df = duckdiffDB.execute("SHOW TABLES").fetchdf()
-                st.subheader("📋 Tables in DuckDB")
-                st.dataframe(tables_df)
-
-                # Compare data
-                log.text("🔍 Performing data comparison...")
-                order_by_clause = ", ".join(str(i + 2) for i in range(len(target_columns)))
-                st.info(f"Order By Clause: {order_by_clause}")
-
-                duckdb_result = duckdiffDB.execute(f"""
-                    SELECT 'source' AS __duckdiff_source__, * FROM source_table
-                    UNION ALL
-                    SELECT 'target' AS __duckdiff_source__, * FROM target_table
-                    ORDER BY {order_by_clause}, 1
-                """)
-                st.success("✅ Query executed successfully!")
-                st.dataframe(duckdb_result.fetchdf())
-
-            else:
-                st.warning("Query executed successfully. But one or both queries returned no data.")
-
-        except Exception as e:
-            st.error(f"❌ An error occurred:\n\n{e}")
-
-# bala's modifie code
-import streamlit as st
-from sqlalchemy import create_engine, text
-import example_duck
-import polars as pl
-import pandas as pd  # Only for final display
-
-st.set_page_config(page_title="Data Comparison Tool - Match & Difference", layout="wide")
-st.title("🔍 Data Comparison Tool - Row-wise Match & Difference")
-
-source, target = st.columns(2)
-duckdiffDB = example_duck.connect(database=":memory:")
-
-with source:
-    source_db_url = st.text_input("Enter Source DB URL", placeholder="e.g., sqlite:///mydb.sqlite")
-    source_query = st.text_area("Source Query", "SELECT * FROM my_table LIMIT 10")
-
-with target:
-    target_db_url = st.text_input("Enter Target DB URL", placeholder="e.g., sqlite:///mydb.sqlite")
-    target_query = st.text_area("Target Query", "SELECT * FROM my_table LIMIT 10")
-
-if st.button("Run Comparison"):
-    if not source_db_url or not source_query.strip() or not target_db_url or not target_query.strip():
-        st.error("Provide both DB URLs and queries.")
-    else:
-        try:
-            st.info("Running comparison...")
-            duckdiffDB.execute("DROP TABLE IF EXISTS source_table")
-            duckdiffDB.execute("DROP TABLE IF EXISTS target_table")
-
-            # Load Source
-            source_engine = create_engine(source_db_url)
-            with source_engine.connect() as conn:
-                source_df = pl.read_database(query=text(source_query), connection=conn)
-                duckdiffDB.register("source_table", source_df)
-
-            # Load Target
-            target_engine = create_engine(target_db_url)
-            with target_engine.connect() as conn:
-                target_df = pl.read_database(query=text(target_query), connection=conn)
-                duckdiffDB.register("target_table", target_df)
-
-            # Normalize column order (not names!)
-            cols = duckdiffDB.execute("PRAGMA table_info(source_table)").fetchall()
-            col_expr = ", ".join([f'"{col[1]}"' for col in cols])  # preserve case
-
-            # Matching rows: SOURCE_MATCH and TARGET_MATCH
-            source_match_query = f"""
-                SELECT 'SOURCE_MATCH' AS status, {col_expr}
-                FROM source_table
-                INTERSECT
-                SELECT 'SOURCE_MATCH' AS status, {col_expr}
-                FROM target_table
-            """
-            target_match_query = f"""
-                SELECT 'TARGET_MATCH' AS status, {col_expr}
-                FROM target_table
-                INTERSECT
-                SELECT 'TARGET_MATCH' AS status, {col_expr}
-                FROM source_table
-            """
-
-            # Non-matching rows
-            source_only_query = f"""
-                SELECT 'SOURCE_NON_MATCH' AS status, {col_expr}
-                FROM source_table
-                EXCEPT
-                SELECT 'SOURCE_NON_MATCH' AS status, {col_expr}
-                FROM target_table
-            """
-            target_only_query = f"""
-                SELECT 'TARGET_NON_MATCH' AS status, {col_expr}
-                FROM target_table
-                EXCEPT
-                SELECT 'TARGET_NON_MATCH' AS status, {col_expr}
-                FROM source_table
-            """
-
-            # Combine all
-            final_query = f"""
-                {source_match_query}
-                UNION ALL
-                {target_match_query}
-                UNION ALL
-                {source_only_query}
-                UNION ALL
-                {target_only_query}
-            """
-
-            result_df = duckdiffDB.execute(final_query).fetchdf()
-            st.success("Comparison complete!")
-            st.dataframe(result_df, use_container_width=True)
-
-        except Exception as e:
-            st.error(f"An error occurred:\n{e}")
-
-# version 2
-import streamlit as st
-from sqlalchemy import create_engine, text
-import polars as pl
-import pandas as pd
-import duckdb
-
-# Streamlit setup
-st.set_page_config(page_title="Data Comparison Tool - Match & Difference", layout="wide")
-st.title("🔍 Data Comparison Tool - Row-wise Match & Difference")
-
-# Layout for input
-source, target = st.columns(2)
-duckdiffDB = duckdb.connect(database=":memory:")
-
-# Source DB and Query
-with source:
-    source_db_url = st.text_input("Enter Source DB URL", placeholder="e.g., sqlite:///source.db")
-    source_query = st.text_area("Source Query", "SELECT * FROM my_table LIMIT 10")
-
-# Target DB and Query
-with target:
-    target_db_url = st.text_input("Enter Target DB URL", placeholder="e.g., sqlite:///target.db")
-    target_query = st.text_area("Target Query", "SELECT * FROM my_table LIMIT 10")
-
-# Compare Button
-if st.button("Run Comparison"):
-    if not source_db_url or not source_query.strip() or not target_db_url or not target_query.strip():
-        st.error("Provide both DB URLs and queries.")
-    else:
-        try:
-            st.info("Running comparison...")
-
-            # Reset temp tables
-            duckdiffDB.execute("DROP TABLE IF EXISTS source_table")
-            duckdiffDB.execute("DROP TABLE IF EXISTS target_table")
-
-            # Load Source
-            source_engine = create_engine(source_db_url)
-            with source_engine.connect() as conn:
-                source_df = pl.read_database(query=text(source_query), connection=conn)
-                duckdiffDB.register("source_table", source_df)
-
-            # Load Target
-            target_engine = create_engine(target_db_url)
-            with target_engine.connect() as conn:
-                target_df = pl.read_database(query=text(target_query), connection=conn)
-                duckdiffDB.register("target_table", target_df)
-
-            # Get column list
-            cols = duckdiffDB.execute("PRAGMA table_info(source_table)").fetchall()
-            col_expr = ", ".join([f'"{col[1]}"' for col in cols])  # preserve column case
-
-            # Queries for matches and diffs
-            source_match_query = f"""
-                SELECT 'SOURCE_MATCH' AS status, {col_expr}
-                FROM source_table
-                INTERSECT
-                SELECT 'SOURCE_MATCH' AS status, {col_expr}
-                FROM target_table
-            """
-            target_match_query = f"""
-                SELECT 'TARGET_MATCH' AS status, {col_expr}
-                FROM target_table
-                INTERSECT
-                SELECT 'TARGET_MATCH' AS status, {col_expr}
-                FROM source_table
-            """
-            source_only_query = f"""
-                SELECT 'SOURCE_NON_MATCH' AS status, {col_expr}
-                FROM source_table
-                EXCEPT
-                SELECT 'SOURCE_NON_MATCH' AS status, {col_expr}
-                FROM target_table
-            """
-            target_only_query = f"""
-                SELECT 'TARGET_NON_MATCH' AS status, {col_expr}
-                FROM target_table
-                EXCEPT
-                SELECT 'TARGET_NON_MATCH' AS status, {col_expr}
-                FROM source_table
-            """
-
-            final_query = f"""
-                {source_match_query}
-                UNION ALL
-                {target_match_query}
-                UNION ALL
-                {source_only_query}
-                UNION ALL
-                {target_only_query}
-            """
-
-            # Execute and get result
-            result_df = duckdiffDB.execute(final_query).fetchdf()
-
-            # Highlight styling
-            def highlight_diff(row):
-                if row['status'] == 'SOURCE_NON_MATCH':
-                    return ['background-color: #155724'] * len(row)  # green
-                elif row['status'] == 'TARGET_NON_MATCH':
-                    return ['background-color: #721c24'] * len(row)  # red
-                else:
-                    return [''] * len(row)
-
-            styled_df = result_df.style.apply(highlight_diff, axis=1)
-
-            # Display results
-            st.success("✅ Comparison complete!")
-            st.write(styled_df)
-
-        except Exception as e:
-            st.error(f"❌ An error occurred:\n{e}")
-
-
-# recent with color tags math and not match
-import streamlit as st
-from sqlalchemy import create_engine, text
-import polars as pl
-import pandas as pd
-import duckdb
-
-# Streamlit setup
-st.set_page_config(page_title="Data Comparison Tool - Match & Difference", layout="wide")
-st.title("🔍 Data Comparison Tool - Row-wise Match & Difference")
-
-# Layout for input
-source, target = st.columns(2)
-duckdiffDB = duckdb.connect(database=":memory:")
-
-# Source DB and Query
-with source:
-    source_db_url = st.text_input("Enter Source DB URL", placeholder="e.g., sqlite:///source.db")
-    source_query = st.text_area("Source Query", "SELECT * FROM my_table LIMIT 10")
-
-# Target DB and Query
-with target:
-    target_db_url = st.text_input("Enter Target DB URL", placeholder="e.g., sqlite:///target.db")
-    target_query = st.text_area("Target Query", "SELECT * FROM my_table LIMIT 10")
-
-# Compare Button
-if st.button("Run Comparison"):
-    if not source_db_url or not source_query.strip() or not target_db_url or not target_query.strip():
-        st.error("Provide both DB URLs and queries.")
-    else:
-        try:
-            st.info("Running comparison...")
-
-            # Reset temp tables
-            duckdiffDB.execute("DROP TABLE IF EXISTS source_table")
-            duckdiffDB.execute("DROP TABLE IF EXISTS target_table")
-
-            # Load Source
-            source_engine = create_engine(source_db_url)
-            with source_engine.connect() as conn:
-                source_df = pl.read_database(query=text(source_query), connection=conn)
-                duckdiffDB.register("source_table", source_df)
-
-                # ✅ Show source table
+                    st.error("⚠️ Provide either file or DB + query for source.")
+                    st.stop()
+
+                # Preview or query result
+                result_df = duckdiffDB.execute(source_query).fetchdf()
                 st.subheader("📘 Source Table Preview")
-                st.dataframe(source_df.to_pandas())
+                st.dataframe(pl.from_pandas(result_df), use_container_width=True)
+
+                # Load Target
+                target_engine = create_engine(target_db_url)
+                with target_engine.connect() as conn:
+                    target_df = pl.read_database(query=text(target_query), connection=conn)
+                target_df = target_df.rename({col: col.strip().lower() for col in target_df.columns})
+                duckdiffDB.register("target_table", target_df)
+                st.subheader("📙 Target Table Preview")
+                st.dataframe(target_df, use_container_width=True)
+
+                # Show diffs only if full table queries
+                if "select *" in source_query.lower() and "select *" in target_query.lower():
+                    show_target_not_in_source()
+                    show_record_level_diff()
+
+            except Exception as e:
+                st.error(f"❌ Comparison failed:\n{e}")
+        else:
+            st.error("⚠️ Please provide all required input.")
+
+
+# all results together
+        
+
+import streamlit as st
+from sqlalchemy import create_engine, text
+import polars as pl
+import duckdb
+import io
+import json
+
+# Setup
+st.set_page_config(page_title="Universal Validator", layout="wide")
+st.title("🔍 DB Validation Tool (Source & Target) - Polars + DuckDB")
+
+# DuckDB in-memory
+duckdb_conn = duckdb.connect(database=":memory:")
+
+# Layout
+left, right = st.columns(2)
+
+# Left: Source Input
+with left:
+    st.subheader("📂 Source Input")
+    source_type = st.radio("Source Type", ["CSV", "JSON", "Database"], horizontal=True)
+    uploaded_file = st.file_uploader("Upload Source File", type=["csv", "json"])
+    source_db_url = st.text_input("Source DB URL", placeholder="e.g., sqlite:///source.db")
+    source_query = st.text_area("Source Query", "SELECT * FROM employee")
+
+# Right: Target Input
+with right:
+    st.subheader("🎯 Target Input")
+    target_type = "Database"
+    target_db_url = st.text_input("Target DB URL", placeholder="e.g., sqlite:///target.db")
+    target_query = st.text_area("Target Query", "SELECT * FROM employee")
+
+# ---------- Load Function ----------
+def load_into_duckdb(name, file, db_url, query, input_type):
+    if file:
+        content = file.read()
+        file.seek(0)
+        if input_type == "CSV":
+            df = pl.read_csv(io.BytesIO(content))
+        elif input_type == "JSON":
+            records = json.load(io.BytesIO(content))
+            if isinstance(records, list):
+                df = pl.DataFrame(records)
+            else:
+                st.error("JSON must be a list of objects.")
+                st.stop()
+        else:
+            st.error("Unsupported type")
+            st.stop()
+    elif db_url and query:
+        engine = create_engine(db_url)
+        with engine.connect() as conn:
+            df = pl.read_database(query=text(query), connection=conn)
+    else:
+        st.error("Provide valid input")
+        st.stop()
+
+    df = df.rename({col: col.strip().lower() for col in df.columns})
+    duckdb_conn.register(name, df)
+    return df
+
+# ---------- Validation Function ----------
+def run_validations(table_name):
+    st.subheader(f"📋 Validations for `{table_name}`")
+
+    # 1. Preview
+    st.markdown("✅ Preview")
+    st.dataframe(duckdb_conn.execute(f"SELECT * FROM {table_name} LIMIT 10").fetchdf(), use_container_width=True)
+
+    # 2. Schema
+    st.markdown("📐 Table Schema")
+    schema_df = duckdb_conn.execute(f"PRAGMA table_info('{table_name}')").fetchdf()
+    st.dataframe(schema_df, use_container_width=True)
+
+    # 3. Self Join on name mismatch
+    st.markdown("🔁 Name matches but dept differs")
+    join_query = f"""
+        SELECT a.id, a.name, a.dept_id 
+        FROM {table_name} a 
+        JOIN {table_name} b 
+        ON a.name = b.name AND a.id != b.id AND a.dept_id != b.dept_id
+    """
+    mismatch_df = duckdb_conn.execute(join_query).fetchdf()
+    st.dataframe(mismatch_df, use_container_width=True)
+
+    # 4. Duplicate Names
+    st.markdown("👥 Duplicate Names")
+    dup_df = duckdb_conn.execute(f"""
+        SELECT name, COUNT(*) as count 
+        FROM {table_name}
+        GROUP BY name
+        HAVING COUNT(*) > 1
+    """).fetchdf()
+    st.dataframe(dup_df, use_container_width=True)
+
+    # 5. Aggregates
+    st.markdown("📊 Aggregates")
+    agg_df = duckdb_conn.execute(f"""
+        SELECT MAX(id) as max_id, MIN(id) as min_id, COUNT(DISTINCT dept_id) as distinct_depts 
+        FROM {table_name}
+    """).fetchdf()
+    st.dataframe(agg_df, use_container_width=True)
+
+# ---------- Run Button ----------
+if st.button("Run Validations"):
+    try:
+        duckdb_conn.execute("DROP TABLE IF EXISTS source")
+        duckdb_conn.execute("DROP TABLE IF EXISTS target")
+
+        # Load source
+        source_df = load_into_duckdb("source", uploaded_file, source_db_url, source_query, source_type)
+        st.success("✅ Source loaded")
+        run_validations("source")
+
+        # Load and validate target if provided
+        if target_db_url.strip() and target_query.strip():
+            target_df = load_into_duckdb("target", None, target_db_url, target_query, "Database")
+            st.success("✅ Target loaded")
+            run_validations("target")
+
+            # Optional: Show differences
+            st.subheader("📍 Rows in Target NOT in Source")
+            diff_query = "SELECT * FROM target EXCEPT SELECT * FROM source"
+            diff_df = duckdb_conn.execute(diff_query).fetchdf()
+            st.dataframe(pl.from_pandas(diff_df), use_container_width=True)
+
+    except Exception as e:
+        st.error(f"❌ Error: {e}")
+
+
+# niot working for csv / json (duplicated query)
+import streamlit as st
+from sqlalchemy import create_engine, text
+import polars as pl
+import duckdb
+import io
+import json
+
+# Setup
+st.set_page_config(page_title="Data Comparison Tool", layout="wide")
+st.title("🔍 Data Comparison Tool - File or DB vs DB")
+
+# In-memory DuckDB
+duckdiffDB = duckdb.connect(database=":memory:")
+
+# Layout
+left_col, right_col = st.columns(2)
+
+# ---------- LEFT: Source Input ----------
+with left_col:
+    st.subheader("📂 Source Input")
+    source_input_type = st.radio("Source Type", ["CSV", "JSON", "Database"], horizontal=True)
+    uploaded_file = st.file_uploader("Upload Source File (optional)", type=["csv", "json"])
+    source_db_url = st.text_input("Source DB URL", placeholder="e.g., sqlite:///source.db")
+    source_query = st.text_area("Source Query", "SELECT * FROM source_table")
+
+# ---------- RIGHT: Target DB ----------
+with right_col:
+    st.subheader("🎯 Target Database")
+    target_db_url = st.text_input("Target DB URL", placeholder="e.g., sqlite:///target.db")
+    target_query = st.text_area("Target Query", "SELECT * FROM target_table")
+
+# ---------- Comparison Utilities ----------
+def show_target_not_in_source():
+    st.subheader("🚫 IDs in Target but Not in Source")
+    try:
+        source_cols = duckdiffDB.execute("PRAGMA table_info(source_table)").fetchdf()
+        target_cols = duckdiffDB.execute("PRAGMA table_info(target_table)").fetchdf()
+
+        source_col_names = set(source_cols["name"].str.lower())
+        target_col_names = set(target_cols["name"].str.lower())
+        common_cols = source_col_names.intersection(target_col_names)
+
+        if not common_cols:
+            st.warning("No common columns found.")
+            return
+
+        key_col = "id" if "id" in common_cols else list(common_cols)[0]
+        st.markdown(f"🔑 Comparing by `{key_col}`")
+
+        query = f"""
+            SELECT {key_col}
+            FROM target_table
+            WHERE {key_col} NOT IN (SELECT {key_col} FROM source_table)
+        """
+        result = duckdiffDB.execute(query).fetchdf()
+        if not result.empty:
+            st.dataframe(pl.from_pandas(result), use_container_width=True)
+            st.success(f"✅ Found {result.shape[0]} records only in target.")
+        else:
+            st.info("✅ All target IDs are present in source.")
+    except Exception as e:
+        st.warning(f"Error: {e}")
+
+def show_record_level_diff():
+    st.subheader("🔄 Non-Matching Records")
+    try:
+        df1 = duckdiffDB.execute("""
+            SELECT *, 'target' AS origin FROM target_table
+            EXCEPT
+            SELECT *, 'target' FROM source_table
+        """).fetchdf()
+
+        df2 = duckdiffDB.execute("""
+            SELECT *, 'source' AS origin FROM source_table
+            EXCEPT
+            SELECT *, 'source' FROM target_table
+        """).fetchdf()
+
+        full_diff = pl.concat([
+            pl.from_pandas(df2),
+            pl.from_pandas(df1)
+        ])
+
+        if not full_diff.is_empty():
+            st.dataframe(full_diff, use_container_width=True)
+            st.success(f"✅ Found {full_diff.shape[0]} differing records.")
+        else:
+            st.info("✅ No differences found.")
+    except Exception as e:
+        st.warning(f"❌ Diff error: {e}")
+
+# ---------- Run Comparison ----------
+if st.button("Run Comparison"):
+    if (uploaded_file or (source_db_url.strip() and source_query.strip())) and \
+       target_db_url.strip() and target_query.strip():
+        try:
+            duckdiffDB.execute("DROP TABLE IF EXISTS source_table")
+            duckdiffDB.execute("DROP TABLE IF EXISTS target_table")
+
+            # Load Source
+            if uploaded_file:
+                content = uploaded_file.read()
+                uploaded_file.seek(0)
+                if source_input_type == "CSV":
+                    source_df = pl.read_csv(io.BytesIO(content))
+                elif source_input_type == "JSON":
+                    records = json.load(io.BytesIO(content))
+                    if not isinstance(records, list):
+                        st.error("Uploaded JSON must be an array of records.")
+                        st.stop()
+                    source_df = pl.DataFrame(records)
+                else:
+                    st.error("⚠️ Unsupported file type.")
+                    st.stop()
+            else:
+                source_engine = create_engine(source_db_url)
+                with source_engine.connect() as conn:
+                    source_df = pl.read_database(query=text(source_query), connection=conn)
+
+            source_df = source_df.rename({col: col.strip().lower() for col in source_df.columns})
+            duckdiffDB.register("source_table", source_df)
+
+            # Preview Source
+            preview_df = duckdiffDB.execute("SELECT * FROM source_table LIMIT 100").fetchdf()
+            st.subheader("📘 Source Table Preview")
+            st.dataframe(pl.from_pandas(preview_df), use_container_width=True)
 
             # Load Target
             target_engine = create_engine(target_db_url)
             with target_engine.connect() as conn:
                 target_df = pl.read_database(query=text(target_query), connection=conn)
-                duckdiffDB.register("target_table", target_df)
 
-                # ✅ Show target table
-                st.subheader("📙 Target Table Preview")
-                st.dataframe(target_df.to_pandas())
+            target_df = target_df.rename({col: col.strip().lower() for col in target_df.columns})
+            duckdiffDB.register("target_table", target_df)
+            st.subheader("📙 Target Table Preview")
+            st.dataframe(target_df, use_container_width=True)
 
-            # Get column list
-            cols = duckdiffDB.execute("PRAGMA table_info(source_table)").fetchall()
-            col_expr = ", ".join([f'"{col[1]}"' for col in cols])  # preserve column case
-
-            # Queries for matches and diffs
-            source_match_query = f"""
-                SELECT 'SOURCE_MATCH' AS status, {col_expr}
-                FROM source_table
-                INTERSECT
-                SELECT 'SOURCE_MATCH' AS status, {col_expr}
-                FROM target_table
-            """
-            target_match_query = f"""
-                SELECT 'TARGET_MATCH' AS status, {col_expr}
-                FROM target_table
-                INTERSECT
-                SELECT 'TARGET_MATCH' AS status, {col_expr}
-                FROM source_table
-            """
-            source_only_query = f"""
-                SELECT 'SOURCE_NON_MATCH' AS status, {col_expr}
-                FROM source_table
-                EXCEPT
-                SELECT 'SOURCE_NON_MATCH' AS status, {col_expr}
-                FROM target_table
-            """
-            target_only_query = f"""
-                SELECT 'TARGET_NON_MATCH' AS status, {col_expr}
-                FROM target_table
-                EXCEPT
-                SELECT 'TARGET_NON_MATCH' AS status, {col_expr}
-                FROM source_table
-            """
-
-            final_query = f"""
-                {source_match_query}
-                UNION ALL
-                {target_match_query}
-                UNION ALL
-                {source_only_query}
-                UNION ALL
-                {target_only_query}
-            """
-
-            # Execute and get result
-            result_df = duckdiffDB.execute(final_query).fetchdf()
-
-            # Highlight styling
-            def highlight_diff(row):
-                if row['status'] == 'SOURCE_NON_MATCH':
-                    return ['background-color: #155724'] * len(row)  # green
-                elif row['status'] == 'TARGET_NON_MATCH':
-                    return ['background-color: #721c24'] * len(row)  # red
-                else:
-                    return [''] * len(row)
-
-            styled_df = result_df.style.apply(highlight_diff, axis=1)
-
-            # Display results
-            st.success("✅ Comparison complete!")
-            st.write(styled_df)
+            # Show diffs (only for SELECT * cases)
+            if "select *" in source_query.lower() and "select *" in target_query.lower():
+                show_target_not_in_source()
+                show_record_level_diff()
 
         except Exception as e:
-            st.error(f"❌ An error occurred:\n{e}")
+            st.error(f"❌ Comparison failed:\n{e}")
+    else:
+        st.error("⚠️ Please provide all required input.")
+
+# ---------- Join File and Target DB ----------
+if st.button("Join File and Target DB"):
+    if uploaded_file and target_db_url.strip() and target_query.strip():
+        try:
+            content = uploaded_file.read()
+            uploaded_file.seek(0)
+            if source_input_type == "CSV":
+                source_df = pl.read_csv(io.BytesIO(content))
+            elif source_input_type == "JSON":
+                records = json.load(io.BytesIO(content))
+                if not isinstance(records, list):
+                    st.error("Uploaded JSON must be an array of records.")
+                    st.stop()
+                source_df = pl.DataFrame(records)
+            else:
+                st.error("Unsupported file type.")
+                st.stop()
+
+            source_df = source_df.rename({col: col.strip().lower() for col in source_df.columns})
+
+            # Load target
+            target_engine = create_engine(target_db_url)
+            with target_engine.connect() as conn:
+                target_df = pl.read_database(query=text(target_query), connection=conn)
+            target_df = target_df.rename({col: col.strip().lower() for col in target_df.columns})
+
+            # Register in DuckDB
+            duckdiffDB.register("source_file", source_df)
+            duckdiffDB.register("target", target_df)
+
+            # Join condition
+            common_cols = set(source_df.columns).intersection(set(target_df.columns))
+            if "dept_id" in source_df.columns and "id" in target_df.columns:
+                join_condition = "s.dept_id = t.id"
+            elif common_cols:
+                join_col = list(common_cols)[0]
+                join_condition = f"s.{join_col} = t.{join_col}"
+            else:
+                st.warning("⚠️ No common columns to join.")
+                st.stop()
+
+            # Perform join
+            join_query = f"""
+                SELECT s.*, t.name AS target_name
+                FROM source_file s
+                JOIN target t ON {join_condition}
+            """
+            join_df = duckdiffDB.execute(join_query).fetchdf()
+            st.subheader("🔗 Joined Result")
+            st.dataframe(pl.from_pandas(join_df), use_container_width=True)
+            st.success(f"✅ Joined on: `{join_condition}`")
+
+        except Exception as e:
+            st.error(f"❌ Join failed: {e}")
+    else:
+        st.error("⚠️ Upload source file and provide target DB + query.")
+
+
+#both csv and json in right side as well
+import streamlit as st
+from sqlalchemy import create_engine, text
+import polars as pl
+import duckdb
+import io
+import json
+
+st.set_page_config(page_title="Data Comparison Tool", layout="wide")
+st.title("🔍 Data Comparison Tool - File or DB vs DB")
+
+# Setup DuckDB
+if "duckdiffDB" not in st.session_state:
+    st.session_state.duckdiffDB = duckdb.connect(database=":memory:")
+duckdiffDB = st.session_state.duckdiffDB
+
+# Initialize session state for source/target
+for key in ["source_df", "target_df"]:
+    if key not in st.session_state:
+        st.session_state[key] = None
+
+# Layout
+left_col, right_col = st.columns(2)
+
+# Source Input
+with left_col:
+    st.subheader("📂 Source Input")
+    source_input_type = st.radio("Source Type", ["CSV", "JSON", "Database"], horizontal=True, key="source_type")
+    uploaded_file = st.file_uploader("Upload Source File", type=["csv", "json"], key="source_file")
+    source_db_url = st.text_input("Source DB URL", placeholder="e.g., sqlite:///source.db", key="src_url")
+    source_query = st.text_area("Source Query", "SELECT * FROM source_table", key="src_query")
+
+# Target Input
+with right_col:
+    st.subheader("🎯 Target Input")
+    target_input_type = st.radio("Target Type", ["CSV", "JSON", "Database"], horizontal=True, key="target_type")
+    uploaded_target_file = st.file_uploader("Upload Target File", type=["csv", "json"], key="target_file")
+    target_db_url = st.text_input("Target DB URL", placeholder="e.g., sqlite:///target.db", key="tgt_url")
+    target_query = st.text_area("Target Query", "SELECT * FROM target_table", key="tgt_query")
+
+# Load Source
+def load_source():
+    df = None
+    if source_input_type in ["CSV", "JSON"] and uploaded_file:
+        content = uploaded_file.read()
+        uploaded_file.seek(0)
+        if source_input_type == "CSV":
+            df = pl.read_csv(io.BytesIO(content))
+        elif source_input_type == "JSON":
+            records = json.load(io.BytesIO(content))
+            if not isinstance(records, list):
+                st.error("Uploaded JSON must be an array of records.")
+                st.stop()
+            df = pl.DataFrame(records)
+
+        df = df.rename({col: col.strip().lower() for col in df.columns})
+        st.session_state.source_df = df
+        duckdiffDB.execute("DROP VIEW IF EXISTS source_table")
+        duckdiffDB.execute("DROP TABLE IF EXISTS source_table")
+        duckdiffDB.register("source_table", df)
+
+    elif source_input_type == "Database" and source_db_url.strip() and source_query.strip():
+        try:
+            engine = create_engine(source_db_url)
+            with engine.connect() as conn:
+                df = pl.read_database(query=text(source_query), connection=conn)
+            df = df.rename({col: col.strip().lower() for col in df.columns})
+            st.session_state.source_df = df
+            duckdiffDB.execute("DROP VIEW IF EXISTS source_table")
+            duckdiffDB.execute("DROP TABLE IF EXISTS source_table")
+            duckdiffDB.register("source_table", df)
+        except Exception as e:
+            st.error(f"❌ Source DB error: {e}")
+
+# Load Target
+def load_target():
+    df = None
+    if target_input_type in ["CSV", "JSON"] and uploaded_target_file:
+        content = uploaded_target_file.read()
+        uploaded_target_file.seek(0)
+        if target_input_type == "CSV":
+            df = pl.read_csv(io.BytesIO(content))
+        elif target_input_type == "JSON":
+            records = json.load(io.BytesIO(content))
+            if not isinstance(records, list):
+                st.error("Uploaded JSON must be an array of records.")
+                st.stop()
+            df = pl.DataFrame(records)
+
+        df = df.rename({col: col.strip().lower() for col in df.columns})
+        st.session_state.target_df = df
+        duckdiffDB.execute("DROP VIEW IF EXISTS target_table")
+        duckdiffDB.execute("DROP TABLE IF EXISTS target_table")
+        duckdiffDB.register("target_table", df)
+
+    elif target_input_type == "Database" and target_db_url.strip() and target_query.strip():
+        try:
+            engine = create_engine(target_db_url)
+            with engine.connect() as conn:
+                df = pl.read_database(query=text(target_query), connection=conn)
+            df = df.rename({col: col.strip().lower() for col in df.columns})
+            st.session_state.target_df = df
+            duckdiffDB.execute("DROP VIEW IF EXISTS target_table")
+            duckdiffDB.execute("DROP TABLE IF EXISTS target_table")
+            duckdiffDB.register("target_table", df)
+        except Exception as e:
+            st.error(f"❌ Target DB error: {e}")
+
+# Show ID Differences
+def show_target_not_in_source():
+    try:
+        result = duckdiffDB.execute("""
+            SELECT id FROM target_table
+            WHERE id NOT IN (SELECT id FROM source_table)
+        """).fetchdf()
+        if not result.empty:
+            st.subheader("🚫 IDs in Target but Not in Source")
+            st.dataframe(result, use_container_width=True)
+        else:
+            st.success("✅ All IDs in target exist in source.")
+    except Exception as e:
+        st.error(f"❌ ID diff error: {e}")
+
+# Show Record Differences
+def show_record_level_diff():
+    try:
+        df_source = duckdiffDB.execute("""
+            SELECT * FROM source_table
+            EXCEPT
+            SELECT * FROM target_table
+            ORDER BY id DESC
+        """).fetchall()
+
+        df_target = duckdiffDB.execute("""
+            SELECT * FROM target_table
+            EXCEPT
+            SELECT * FROM source_table
+            ORDER BY id DESC
+        """).fetchall()
+
+        column_names = [desc[0] for desc in duckdiffDB.description]
+        interleaved = []
+        for i in range(max(len(df_source), len(df_target))):
+            if i < len(df_source):
+                interleaved.append(df_source[i] + ("source",))
+            if i < len(df_target):
+                interleaved.append(df_target[i] + ("target",))
+
+        if not interleaved:
+            st.success("✅ No differences found.")
+            return
+
+        final_columns = column_names + ["origin"]
+        html = "<table style='width:100%; border-collapse:collapse;'>"
+        html += "<thead><tr>" + "".join([f"<th style='border:1px solid #ccc; padding:6px'>{col}</th>" for col in final_columns]) + "</tr></thead><tbody>"
+        for row in interleaved:
+            color = "green" if row[-1] == "source" else "red"
+            html += "<tr>" + "".join([f"<td style='color:{color}; border:1px solid #ccc; padding:6px'>{cell}</td>" for cell in row]) + "</tr>"
+        html += "</tbody></table>"
+        st.markdown(html, unsafe_allow_html=True)
+        st.success(f"✅ Found {len(interleaved)} differing records.")
+    except Exception as e:
+        st.error(f"❌ Diff error: {e}")
+
+# Run Comparison
+if st.button("Run Comparison"):
+    load_source()
+    load_target()
+    if st.session_state.source_df is not None:
+        st.subheader("📘 Source Preview")
+        st.dataframe(st.session_state.source_df, use_container_width=True)
+    if st.session_state.target_df is not None:
+        st.subheader("📙 Target Preview")
+        st.dataframe(st.session_state.target_df, use_container_width=True)
+
+    if duckdiffDB.execute("PRAGMA show_tables").fetchall():
+        show_target_not_in_source()
+        show_record_level_diff()
+
+# Join Logic
+if st.button("Join File and Target DB"):
+    try:
+        if st.session_state.source_df is None or st.session_state.target_df is None:
+            st.error("❌ Source or Target data is missing.")
+            st.stop()
+
+        source_df = st.session_state.source_df
+        target_df = st.session_state.target_df
+
+        common_cols = set(source_df.columns).intersection(set(target_df.columns))
+        if "dept_id" in source_df.columns and "id" in target_df.columns:
+            join_col_source = "dept_id"
+            join_col_target = "id"
+        elif common_cols:
+            join_col_source = join_col_target = list(common_cols)[0]
+        else:
+            st.warning("⚠️ No common columns to join.")
+            st.stop()
+
+        # Rename columns to avoid duplicates
+        source_cols_renamed = [pl.col(c).alias(f"s_{c}") if c != join_col_source else pl.col(c) for c in source_df.columns]
+        target_cols_renamed = [pl.col(c).alias(f"t_{c}") if c != join_col_target else pl.col(c) for c in target_df.columns]
+        source_df = source_df.select(source_cols_renamed)
+        target_df = target_df.select(target_cols_renamed)
+
+        joined_df = source_df.join(
+            target_df,
+            left_on=join_col_source,
+            right_on=join_col_target,
+            how="inner"
+        )
+
+        st.subheader("🔗 Joined Result (Polars Only)")
+        st.dataframe(joined_df, use_container_width=True)
+        st.success(f"✅ Joined on: `s.{join_col_source} = t.{join_col_target}`")
+
+    except Exception as e:
+        st.error(f"❌ Join failed: {e}")
+
